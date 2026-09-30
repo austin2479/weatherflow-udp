@@ -153,6 +153,7 @@ import weewx.wxformulas
 from weeutil.weeutil import tobool
 import syslog
 import threading
+import serial
 
 import sys, getopt
 from socket import *
@@ -175,7 +176,10 @@ fields['evt_strike'] = ('time_epoch', 'distance', 'energy')
 fields['obs_st'] = ('time_epoch', 'wind_lull', 'wind_avg', 'wind_gust', 'wind_direction', 'wind_sample_interval', 'station_pressure', 'air_temperature', 'relative_humidity', 'illuminance', 'uv', 'solar_radiation', 'rain_accumulated', 'precipitation_type', 'lightning_strike_avg_distance', 'lightning_strike_count', 'battery', 'report_interval')
 
 def loader(config_dict, engine):
-    return WeatherFlowUDPDriver(**config_dict[DRIVER_NAME])
+    if config_dict[DRIVER_NAME]['transport'].lower() == "usb":
+        return WeatherFlowUSBDriver(**config_dict[DRIVER_NAME])
+    elif config_dict[DRIVER_NAME]['transport'].lower() == "udp":
+        return WeatherFlowUDPDriver(**config_dict[DRIVER_NAME])
 
 def logmsg(level, msg):
     syslog.syslog(level, 'weatherflowudp: %s: %s' %
@@ -204,80 +208,11 @@ def sendMyLoopPacket(pkt,sensor_map):
 
     return packet
 
-def parseUDPPacket(pkt):
-    packet = dict()
-    if 'serial_number' in pkt:
-        if 'type' in pkt:
-            serial_number = pkt['serial_number'].replace("-","_")
-            pkt_type = pkt['type']
-            pkt_label = serial_number + "." + pkt_type
-            #pkt_keys = pkt.keys()         # Python 2
-            pkt_keys = list(pkt.keys())    # Python 3
-            for i in pkt_keys:
-                pkt_item = i + "." + pkt_label
-                packet[pkt_item] = pkt[i]
-
-            if pkt_type == 'obs_air':
-                packet['time_epoch'] = pkt['obs'][0][0]
-                for i1, obs_val in enumerate(pkt['obs'][0]):
-                    pkt_item1 =  fields['obs_air'][i1] + "." + pkt_label
-                    packet[pkt_item1] = obs_val
-
-            if pkt_type == 'obs_sky':
-                packet['time_epoch'] = pkt['obs'][0][0]
-                for i1, obs_val in enumerate(pkt['obs'][0]):
-                    pkt_item1 =  fields['obs_sky'][i1] + "." + pkt_label
-                    packet[pkt_item1] = obs_val
-
-            if pkt_type == 'obs_st':
-                packet['time_epoch'] = pkt['obs'][0][0]
-                for i1, obs_val in enumerate(pkt['obs'][0]):
-                    pkt_item1 =  fields['obs_st'][i1] + "." + pkt_label
-                    packet[pkt_item1] = obs_val
-
-            if pkt_type == 'rapid_wind':
-                packet['time_epoch'] = pkt['ob'][0]
-                for i1, obs_val in enumerate(pkt['ob']):
-                    pkt_item1 =  fields['rapid_wind'][i1] + "." + pkt_label
-                    packet[pkt_item1] = obs_val
-
-            if pkt_type == 'evt_strike':
-                packet['time_epoch'] = pkt['evt'][0]
-                for i1, obs_val in enumerate(pkt['evt']):
-                    pkt_item1 =  fields['evt_strike'][i1] + "." + pkt_label
-                    packet[pkt_item1] = obs_val
-
-            if pkt_type == 'evt_precip':
-                packet['time_epoch'] = pkt['evt'][0]
-                for i1, obs_val in enumerate(pkt['evt']):
-                    pkt_item1 =  fields['evt_precip'][i1] + "." + pkt_label
-                    packet[pkt_item1] = obs_val
-
-            if pkt_type == 'device_status':
-                packet['time_epoch'] = pkt['timestamp']
-
-            if pkt_type == 'hub_status':
-                packet['time_epoch'] = pkt['timestamp']
-
-            if pkt_type[0:2] == 'X_':
-                packet['time_epoch'] = int(time.time())
-
-        else:
-            loginf('Corrupt UDP packet? %s' % pkt)
-    else:
-        loginf('Corrupt UDP packet? %s' % pkt)
-    return packet
-
-
-class WeatherFlowUDPDriver(weewx.drivers.AbstractDevice):
-
+class WeatherFlowDriver(weewx.drivers.AbstractDevice):
     def __init__(self, **stn_dict):
         loginf('driver version is %s' % DRIVER_VERSION)
+        loginf('using %s transport' % stn_dict.get('transport', 'udp'))
         self._log_raw_packets = tobool(stn_dict.get('log_raw_packets', False))
-        self._udp_address = stn_dict.get('udp_address', '<broadcast>')
-        self._udp_port = int(stn_dict.get('udp_port', 50222))
-        self._udp_timeout = int(stn_dict.get('udp_timeout', 90))
-        self._share_socket = tobool(stn_dict.get('share_socket', False))
         self._sensor_map = stn_dict.get('sensor_map', {})
         loginf('sensor map is %s' % self._sensor_map)
         loginf('*** Sensor names per packet type')
@@ -289,8 +224,94 @@ class WeatherFlowUDPDriver(weewx.drivers.AbstractDevice):
     def hardware_name(self):
         return HARDWARE_NAME
 
-
     def genLoopPackets(self):
+        while True:
+            for packet in self.getChunk():
+                try:
+                    m1 = json.loads(packet)
+                except:
+                    logerr('Packet parse error: %s' % packet)
+                    continue
+                if self._log_raw_packets:
+                    loginf('raw packet: %s' % m1)
+                m2=self.parsePacket(m1)
+                m3=sendMyLoopPacket(m2, self._sensor_map)
+                if len(m3) > 2:
+                    yield m3
+
+class WeatherFlowUDPDriver(WeatherFlowDriver):
+    def __init__(self, **stn_dict):
+        super().__init__(**stn_dict)
+        self._udp_address = stn_dict.get('udp_address', '<broadcast>')
+        self._udp_port = int(stn_dict.get('udp_port', 50222))
+        self._udp_timeout = int(stn_dict.get('udp_timeout', 90))
+        self._share_socket = tobool(stn_dict.get('share_socket', False))
+
+    def parsePacket(self, pkt):
+        packet = dict()
+        if 'serial_number' in pkt:
+            if 'type' in pkt:
+                serial_number = pkt['serial_number'].replace("-","_")
+                pkt_type = pkt['type']
+                pkt_label = serial_number + "." + pkt_type
+                #pkt_keys = pkt.keys()         # Python 2
+                pkt_keys = list(pkt.keys())    # Python 3
+                for i in pkt_keys:
+                    pkt_item = i + "." + pkt_label
+                    packet[pkt_item] = pkt[i]
+    
+                if pkt_type == 'obs_air':
+                    packet['time_epoch'] = pkt['obs'][0][0]
+                    for i1, obs_val in enumerate(pkt['obs'][0]):
+                        pkt_item1 =  fields['obs_air'][i1] + "." + pkt_label
+                        packet[pkt_item1] = obs_val
+    
+                if pkt_type == 'obs_sky':
+                    packet['time_epoch'] = pkt['obs'][0][0]
+                    for i1, obs_val in enumerate(pkt['obs'][0]):
+                        pkt_item1 =  fields['obs_sky'][i1] + "." + pkt_label
+                        packet[pkt_item1] = obs_val
+    
+                if pkt_type == 'obs_st':
+                    packet['time_epoch'] = pkt['obs'][0][0]
+                    for i1, obs_val in enumerate(pkt['obs'][0]):
+                        pkt_item1 =  fields['obs_st'][i1] + "." + pkt_label
+                        packet[pkt_item1] = obs_val
+    
+                if pkt_type == 'rapid_wind':
+                    packet['time_epoch'] = pkt['ob'][0]
+                    for i1, obs_val in enumerate(pkt['ob']):
+                        pkt_item1 =  fields['rapid_wind'][i1] + "." + pkt_label
+                        packet[pkt_item1] = obs_val
+    
+                if pkt_type == 'evt_strike':
+                    packet['time_epoch'] = pkt['evt'][0]
+                    for i1, obs_val in enumerate(pkt['evt']):
+                        pkt_item1 =  fields['evt_strike'][i1] + "." + pkt_label
+                        packet[pkt_item1] = obs_val
+    
+                if pkt_type == 'evt_precip':
+                    packet['time_epoch'] = pkt['evt'][0]
+                    for i1, obs_val in enumerate(pkt['evt']):
+                        pkt_item1 =  fields['evt_precip'][i1] + "." + pkt_label
+                        packet[pkt_item1] = obs_val
+    
+                if pkt_type == 'device_status':
+                    packet['time_epoch'] = pkt['timestamp']
+    
+                if pkt_type == 'hub_status':
+                    packet['time_epoch'] = pkt['timestamp']
+    
+                if pkt_type[0:2] == 'X_':
+                    packet['time_epoch'] = int(time.time())
+    
+            else:
+                loginf('Corrupt UDP packet? %s' % pkt)
+        else:
+            loginf('Corrupt UDP packet? %s' % pkt)
+        return packet
+
+    def getChunk(self):
         loginf('Listening for UDP broadcasts to IP address %s on port %s, with timeout %s and share_socket %s...' % (self._udp_address,self._udp_port,self._udp_timeout,self._share_socket))
 
         s=socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -307,16 +328,53 @@ class WeatherFlowUDPDriver(weewx.drivers.AbstractDevice):
                 timeouterr=1
                 logerr('Socket timeout waiting for incoming UDP packet!')
             if timeouterr == 0:
-                try:
-                    m1 = json.loads(m[0])
-                except:
-                    logerr('Packet parse error: %s' % m[0])
+                yield m[0]
+
+class WeatherFlowUSBDriver(WeatherFlowDriver):
+    def __init__(self, **stn_dict):
+        super().__init__(**stn_dict)
+        self.port = stn_dict.get('usb_port', "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_DC:1E:D5:AD:2E:2C-if00")
+        self.baud = stn_dict.get('usb_baud', 115200)
+
+    def parsePacket(self, pkt):
+        packet = dict()
+        if 'serial_number' in pkt:
+            if 'type' in pkt:
+                serial_number = pkt['serial_number'].replace("-","_")
+                pkt_type = pkt['type']
+                pkt_label = serial_number + "." + pkt_type
+                #pkt_keys = pkt.keys()         # Python 2
+                pkt_keys = list(pkt.keys())    # Python 3
+                for i in pkt_keys:
+                    pkt_item = i + "." + pkt_label
+                    packet[pkt_item] = pkt[i]
+
+                packet['time_epoch'] = int(time.time())
+
+            else:
+                loginf('Corrupt USB packet? %s' % pkt)
+        else:
+            loginf('Corrupt USB packet? %s' % pkt)
+        return packet
+
+    def getChunk(self):
+        buffer = b""
+        with serial.Serial(self.port, self.baud, timeout=1) as ser:
+            while True:
+                data = ser.read(ser.in_waiting or 1)
+    
+                if not data:
                     continue
-                if self._log_raw_packets:
-                    loginf('raw packet: %s' % m1)
-                m2=parseUDPPacket(m1)
-                m3=sendMyLoopPacket(m2, self._sensor_map)
-                if len(m3) > 2:
-                    yield m3
-
-
+    
+                buffer += data
+    
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line:
+                        line = line.decode("utf-8", errors="replace").rstrip()
+                        fields = line.split(" ", 4)
+                        if len(fields) == 4:
+                            level,id,label,msg = fields
+                            if label == "DATA:":
+                                group,payload = msg.split("|")
+                                yield payload
